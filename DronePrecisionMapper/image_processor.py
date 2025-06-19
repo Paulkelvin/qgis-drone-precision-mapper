@@ -13,6 +13,7 @@ from pathlib import Path
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.Qt import Qt
+import hashlib
 
 # QGIS imports
 from qgis.core import (
@@ -20,6 +21,7 @@ from qgis.core import (
     QgsCoordinateReferenceSystem
 )
 from qgis.gui import QgsMapToolEmitPoint, QgsVertexMarker
+from qgis.utils import iface
 
 # GDAL imports
 from osgeo import gdal, osr
@@ -193,7 +195,7 @@ def georeference_image(image_path, log_func=None):
             if log_func:
                 log_func("❌ Error: This image does not contain GPS EXIF data and cannot be processed.")
             return None
-        
+
         # Extract GPS coordinates
         lat = convert_dms_to_degrees(gps_info['GPSLatitude'], log_func)
         if gps_info.get('GPSLatitudeRef') == 'S': lat = -lat
@@ -266,7 +268,7 @@ def georeference_image(image_path, log_func=None):
             if log_func:
                 log_func(f"❌ Error: Calculated ground resolution ({meters_per_pixel:.3f}m/pixel) is outside reasonable range (0.001-10m/pixel). This suggests invalid camera parameters.")
             return None
-        
+
         m_per_deg_lon = 111320 * math.cos(math.radians(lat))
         m_per_deg_lat = 111320
         pixel_width_deg = meters_per_pixel / m_per_deg_lon
@@ -309,12 +311,23 @@ def georeference_image(image_path, log_func=None):
         if log_func:
             log_func(f"Center Coordinates: Lat={lat:.6f}°, Lon={lon:.6f}°")
             log_func(f"Altitude: {altitude:.2f} m | Ground Resolution: {meters_per_pixel:.3f} m/pixel")
+        # Set custom properties for robust identification
+        layer.setCustomProperty("DronePrecisionMapper:source_image", str(image_path))
+        try:
+            with open(image_path, "rb") as f:
+                file_hash = hashlib.md5(f.read()).hexdigest()
+            layer.setCustomProperty("DronePrecisionMapper:file_hash", file_hash)
+        except Exception as e:
+            file_hash = None
+            if log_func:
+                log_func(f"⚠️ Could not compute file hash: {e}")
         return {
             'image_width': width, 'image_height': height,
             'distortion_k1': distortion_k1, 'layer': layer,
-            'layer_path': image_path,  # Add layer path for dynamic layer detection
-            'layer_id': layer.id(),  # Add layer ID for more reliable detection
-            'original_extent': layer.extent()  # Add original extent for matching
+            'layer_path': image_path,  # for reference
+            'layer_source': layer.source(),
+            'file_hash': file_hash,
+            'image_path': image_path
         }
     except Exception as e:
         if log_func:
@@ -421,15 +434,38 @@ def process_multiple_drone_photos(folder_path, log_func=None, progress_bar=None)
     return processed_layers
 
 
+# Utility to load/save persistent counters
+
+def load_persistent_counters():
+    try:
+        project = QgsProject.instance()
+        counters_str = project.readEntry("DronePrecisionMapper", "click_counters", "{}")
+        import json
+        return json.loads(counters_str[0])
+    except Exception as e:
+        print(f"[DEBUG] Failed to load persistent counters: {e}")
+        return {}
+
+def save_persistent_counters(counters):
+    try:
+        project = QgsProject.instance()
+        import json
+        counters_str = json.dumps(counters)
+        project.writeEntry("DronePrecisionMapper", "click_counters", counters_str)
+    except Exception as e:
+        print(f"[DEBUG] Failed to save persistent counters: {e}")
+
+
 class PrecisionClickTool(QgsMapToolEmitPoint):
     """A QGIS Map Tool that corrects a clicked point for lens distortion."""
     
-    def __init__(self, canvas, georef_params, coord_callback=None):
+    def __init__(self, canvas, georef_params, coord_callback=None, persistent_counters=None):
         super().__init__(canvas)
         self.georef_params = georef_params
         self.canvas = canvas
         self.coord_callback = coord_callback
-        self.layer_click_counters = {}  # Track clicks per layer
+        self.persistent_counters = persistent_counters or {}  # Use persistent counters from plugin
+        self.image_path = georef_params.get('image_path', '')  # Store image path for stable counter key
         
         # Create more visible markers
         self.marker = QgsVertexMarker(canvas)
@@ -451,234 +487,82 @@ class PrecisionClickTool(QgsMapToolEmitPoint):
         
         print("PrecisionClickTool initialized successfully")
         print(f"Layer: {georef_params.get('layer', 'None')}")
+        print(f"Image path: {self.image_path}")
         print(f"Image dimensions: {georef_params.get('image_width', 'Unknown')}x{georef_params.get('image_height', 'Unknown')}")
 
     def canvasReleaseEvent(self, event):
         print("Canvas release event triggered!")
-        
-        clicked_map_point = self.toMapCoordinates(event.pos())
-        print(f"Clicked at map coordinates: {clicked_map_point.x():.6f}, {clicked_map_point.y():.6f}")
-        
-        # Smart layer detection: find which layer this click is actually on
-        layer = self._find_layer_for_click(clicked_map_point)
-        
-        if not layer or not isinstance(layer, QgsRasterLayer):
-            print("Error: Could not find valid layer for this click")
+        # Get the active layer at click time
+        active_layer = iface.activeLayer()
+        if not active_layer:
             if self.coord_callback:
-                self.coord_callback("❌ Error: Could not find the image layer for this click. Please reload the image.")
+                self.coord_callback("❌ No active layer.")
             return
-
-        print(f"Found layer for click: {layer.name()}")
-        print(f"Layer extent: {layer.extent().toString()}")
-        print(f"Layer source: {layer.source()}")
-        
-        # Check if click is within the layer extent with more tolerance
-        layer_extent = layer.extent()
-        # Increase tolerance significantly to account for coordinate precision issues and edge cases
-        tolerance = 0.00001  # About 10 meters in degrees (increased from 1 meter)
-        
-        # More flexible bounds checking - check if point is reasonably close to the layer
-        x_min, x_max = layer_extent.xMinimum() - tolerance, layer_extent.xMaximum() + tolerance
-        y_min, y_max = layer_extent.yMinimum() - tolerance, layer_extent.yMaximum() + tolerance
-        
-        if not (x_min <= clicked_map_point.x() <= x_max and y_min <= clicked_map_point.y() <= y_max):
-            # Additional check: if the point is very close to the bounds, allow it anyway
-            distance_to_bounds = min(
-                abs(clicked_map_point.x() - x_min), abs(clicked_map_point.x() - x_max),
-                abs(clicked_map_point.y() - y_min), abs(clicked_map_point.y() - y_max)
-            )
-            
-            # If within 5 meters of bounds, allow the click
-            if distance_to_bounds > 0.00005:  # About 5 meters in degrees
-                if self.coord_callback:
-                    # Use layer name instead of ID in error message
-                    layer_name = layer.name() if layer.name() else "image"
-                    self.coord_callback(f"⚠️ Click outside image bounds - please click within the {layer_name} area")
-                return
-            else:
-                print(f"Click near bounds (distance: {distance_to_bounds:.6f}), allowing it")
-        
-        # Increment click counter
-        self.layer_click_counters[layer.id()] = self.layer_click_counters.get(layer.id(), 0) + 1
-        
+        # Get the persistent identifier
+        file_hash = active_layer.customProperty("DronePrecisionMapper:file_hash", None)
+        source_image = active_layer.customProperty("DronePrecisionMapper:source_image", None)
+        if not file_hash and not source_image:
+            if self.coord_callback:
+                self.coord_callback("❌ The selected layer is not a processed drone image.")
+            return
+        # Use file_hash as the counter key if available, else source_image
+        counter_key = file_hash or source_image
+        # Increment the correct counter
+        self.persistent_counters = load_persistent_counters()
+        click_count = self.persistent_counters.get(counter_key, 0) + 1
+        self.persistent_counters[counter_key] = click_count
+        save_persistent_counters(self.persistent_counters)
+        # Use the original image name for display
+        image_name = Path(source_image).stem if source_image else "Unknown"
+        clicked_map_point = self.toMapCoordinates(event.pos())
         # Show uncorrected marker immediately
         self.uncorrected_marker.setCenter(clicked_map_point)
         self.uncorrected_marker.setVisible(True)
-        
         # Get coordinate transformation
-        provider = layer.dataProvider()
+        provider = active_layer.dataProvider()
         geotransform = provider.extent()
-        
         if not geotransform.isNull():
             width = provider.xSize()
             height = provider.ySize()
-            
-            # Use more reliable coordinate transformation
             try:
-                # Get the layer's coordinate reference system
-                layer_crs = layer.crs()
-                
-                # Calculate pixel size more accurately
                 pixel_width = geotransform.width() / width
                 pixel_height = geotransform.height() / height
                 x_origin = geotransform.xMinimum()
                 y_origin = geotransform.yMaximum()
-                
-                # Convert map coordinates to pixel coordinates
                 px = (clicked_map_point.x() - x_origin) / pixel_width
                 py = (y_origin - clicked_map_point.y()) / pixel_height
-                
-                # Validate pixel coordinates are within image bounds with tolerance
-                pixel_tolerance = 5  # Allow clicks up to 5 pixels outside the image
+                pixel_tolerance = 5
                 if px < -pixel_tolerance or px >= width + pixel_tolerance or py < -pixel_tolerance or py >= height + pixel_tolerance:
                     if self.coord_callback:
                         self.coord_callback("⚠️ Click outside image pixel bounds")
                     return
-                
-                # Clamp pixel coordinates to image bounds
                 px = max(0, min(width - 1, px))
                 py = max(0, min(height - 1, py))
-                
-                print(f"Pixel coordinates: {px:.2f}, {py:.2f}")
-                print(f"Image dimensions: {width}x{height}")
-                print(f"Layer extent: {geotransform.toString()}")
-                
-                # Apply distortion correction
                 px_corr, py_corr = apply_distortion_correction(
                     px, py,
                     self.georef_params['image_width'], self.georef_params['image_height'],
                     self.georef_params['distortion_k1'])
-                
-                # Convert back to map coordinates
                 corrected_map_point = QgsPointXY(
                     x_origin + px_corr * pixel_width,
                     y_origin - py_corr * pixel_height
                 )
-                
-                # Validate corrected coordinates are within layer bounds with tolerance
-                if not (x_min <= corrected_map_point.x() <= x_max and y_min <= corrected_map_point.y() <= y_max):
-                    if self.coord_callback:
-                        self.coord_callback("⚠️ Corrected coordinates outside layer bounds")
-                    return
-                
+                dist_m = clicked_map_point.distance(corrected_map_point) * 111320
+                coord_message = f"📍 {image_name} - Click {click_count}:\n"
+                coord_message += f"   Uncorrected: Lat={clicked_map_point.y():.6f}, Lon={clicked_map_point.x():.6f}\n"
+                coord_message += f"   Corrected:   Lat={corrected_map_point.y():.6f}, Lon={corrected_map_point.x():.6f}\n"
+                coord_message += f"   Correction:  ~{dist_m:.3f} meters\n"
+                if self.coord_callback:
+                    self.coord_callback(coord_message)
+                self.marker.setCenter(corrected_map_point)
+                self.marker.setVisible(True)
+                self.canvas.refresh()
             except Exception as e:
                 print(f"Error in coordinate transformation: {e}")
                 if self.coord_callback:
                     self.coord_callback(f"❌ Error in coordinate calculation: {e}")
                 return
-            
-            # Show corrected marker
-            self.marker.setCenter(corrected_map_point)
-            self.marker.setVisible(True)
-            
-            dist_m = clicked_map_point.distance(corrected_map_point) * 111320
-            
-            # Create coordinate message
-            layer_name = layer.name() if layer.name() else "Unknown Layer"
-            coord_message = f"📍 {layer_name} - Click {self.layer_click_counters[layer.id()]}:\n"
-            coord_message += f"   Uncorrected: Lat={clicked_map_point.y():.6f}, Lon={clicked_map_point.x():.6f}\n"
-            coord_message += f"   Corrected:   Lat={corrected_map_point.y():.6f}, Lon={corrected_map_point.x():.6f}\n"
-            coord_message += f"   Correction:  ~{dist_m:.3f} meters\n"
-            
-            print(f"\n--- Precision Click ---")
-            print(f"Clicked (Uncorrected): Lat={clicked_map_point.y():.6f}, Lon={clicked_map_point.x():.6f}")
-            print(f"Result  (Corrected):  Lat={corrected_map_point.y():.6f}, Lon={corrected_map_point.x():.6f}")
-            print(f"Correction Distance:  ~{dist_m:.3f} meters")
-            
-            # Send to UI if callback is available
-            if self.coord_callback:
-                self.coord_callback(coord_message)
-            
-            # Force canvas refresh to show markers
-            self.canvas.refresh()
         else:
             print("Error: Could not get geotransform from layer")
-    
-    def _find_layer_for_click(self, clicked_point):
-        """Smart layer detection: find which layer this click is actually on."""
-        print("Searching for layer that contains this click...")
-        
-        # Get all raster layers in the project
-        all_layers = QgsProject.instance().mapLayers().values()
-        raster_layers = [l for l in all_layers if isinstance(l, QgsRasterLayer)]
-        
-        if not raster_layers:
-            print("No raster layers found in project")
-            return None
-        
-        # First, try to find our specific layer by path
-        layer_path = self.georef_params.get('layer_path', '')
-        if layer_path:
-            layer_name = Path(layer_path).stem
-            project_layers = QgsProject.instance().mapLayersByName(layer_name)
-            if project_layers:
-                # Check if click is within this layer
-                layer = project_layers[-1]
-                if self._is_click_in_layer(clicked_point, layer):
-                    print(f"Found target layer by name: {layer_name}")
-                    return layer
-        
-        # If not found by name, check all raster layers to see which one contains this click
-        best_layer = None
-        best_distance = float('inf')
-        
-        for layer in raster_layers:
-            if self._is_click_in_layer(clicked_point, layer):
-                # Calculate distance to layer center to find the most relevant one
-                layer_center = layer.extent().center()
-                distance = clicked_point.distance(layer_center)
-                
-                if distance < best_distance:
-                    best_distance = distance
-                    best_layer = layer
-                    print(f"Found layer containing click: {layer.name()} (distance to center: {distance:.6f})")
-        
-        if best_layer:
-            print(f"Selected best layer: {best_layer.name()}")
-            return best_layer
-        
-        # If no layer contains the click, find the closest one
-        closest_layer = None
-        closest_distance = float('inf')
-        
-        for layer in raster_layers:
-            layer_extent = layer.extent()
-            # Calculate distance to layer bounds
-            distance = self._distance_to_layer_bounds(clicked_point, layer_extent)
-            
-            if distance < closest_distance:
-                closest_distance = distance
-                closest_layer = layer
-                print(f"Found closest layer: {layer.name()} (distance to bounds: {distance:.6f})")
-        
-        if closest_layer and closest_distance < 0.0001:  # Within ~10 meters
-            print(f"Using closest layer: {closest_layer.name()}")
-            return closest_layer
-        
-        print("No suitable layer found for this click")
-        return None
-    
-    def _is_click_in_layer(self, clicked_point, layer):
-        """Check if a click point is within a layer's bounds with tolerance."""
-        layer_extent = layer.extent()
-        tolerance = 0.00001  # About 10 meters in degrees
-        
-        x_min, x_max = layer_extent.xMinimum() - tolerance, layer_extent.xMaximum() + tolerance
-        y_min, y_max = layer_extent.yMinimum() - tolerance, layer_extent.yMaximum() + tolerance
-        
-        return (x_min <= clicked_point.x() <= x_max and y_min <= clicked_point.y() <= y_max)
-    
-    def _distance_to_layer_bounds(self, clicked_point, layer_extent):
-        """Calculate the minimum distance from a point to layer bounds."""
-        x, y = clicked_point.x(), clicked_point.y()
-        x_min, x_max = layer_extent.xMinimum(), layer_extent.xMaximum()
-        y_min, y_max = layer_extent.yMinimum(), layer_extent.yMaximum()
-        
-        # Calculate distance to nearest edge
-        dx = max(0, x_min - x, x - x_max)
-        dy = max(0, y_min - y, y - y_max)
-        
-        return math.sqrt(dx*dx + dy*dy)
 
     def deactivate(self):
         """Clean up when tool is deactivated."""
@@ -692,249 +576,111 @@ class PrecisionClickTool(QgsMapToolEmitPoint):
 
 
 class MultiLayerPrecisionClickTool(QgsMapToolEmitPoint):
-    """A QGIS Map Tool that works with multiple layers."""
+    """A QGIS Map Tool that works with multiple layers, always using the QGIS active layer."""
     
-    def __init__(self, canvas, processed_layers, coord_callback=None):
+    def __init__(self, canvas, processed_layers, coord_callback=None, persistent_counters=None):
         super().__init__(canvas)
         self.processed_layers = processed_layers
-        self.current_layer_index = 0
         self.canvas = canvas
         self.coord_callback = coord_callback
-        self.layer_click_counters = {}  # Track clicks per layer
-        
-        # Create markers for each layer
+        self.persistent_counters = persistent_counters or {}
         self.markers = []
         self.uncorrected_markers = []
-        
         for i, layer_data in enumerate(processed_layers):
-            # Corrected marker (red)
             marker = QgsVertexMarker(canvas)
             marker.setColor(QColor("red"))
-            marker.setIconSize(15)  # Increased size
+            marker.setIconSize(15)
             marker.setIconType(QgsVertexMarker.ICON_CROSS)
-            marker.setPenWidth(3)  # Increased pen width
-            marker.setVisible(i == 0)
-            
-            # Uncorrected marker (cyan)
+            marker.setPenWidth(3)
+            marker.setVisible(False)
             uncorrected_marker = QgsVertexMarker(canvas)
             uncorrected_marker.setColor(QColor("cyan"))
-            uncorrected_marker.setIconSize(12)  # Increased size
+            uncorrected_marker.setIconSize(12)
             uncorrected_marker.setIconType(QgsVertexMarker.ICON_BOX)
-            uncorrected_marker.setPenWidth(2)  # Increased pen width
-            uncorrected_marker.setVisible(i == 0)
-            
+            uncorrected_marker.setPenWidth(2)
+            uncorrected_marker.setVisible(False)
             self.markers.append(marker)
             self.uncorrected_markers.append(uncorrected_marker)
-        
-        # Set cursor to indicate this is an active tool
         self.setCursor(Qt.CrossCursor)
-        
         print(f"\n--- Multi-Layer Precision Tool Activated ---")
-        print(f"Current layer: {processed_layers[0]['image_path']}")
-        print(f"Total layers: {len(processed_layers)}")
-        print(f"Use keyboard shortcuts:")
-        print(f"  'N' - Next layer")
-        print(f"  'P' - Previous layer")
-        print(f"  'L' - List all layers")
+        print(f"Use the QGIS Layers Panel to select the active image layer.")
         print(f"Click on the image to get distortion-corrected coordinates.")
-        
-    def canvasReleaseEvent(self, event):
-        print("Multi-layer canvas release event triggered!")
-        
-        if not self.processed_layers:
-            print("Error: No processed layers")
-            return
-            
-        current_layer_data = self.processed_layers[self.current_layer_index]
-        layer = current_layer_data['params']['layer']
-        
-        if not layer or not isinstance(layer, QgsRasterLayer):
-            print("Error: Invalid layer")
-            return
 
+    def canvasReleaseEvent(self, event):
+        active_layer = iface.activeLayer()
+        if not active_layer:
+            self.coord_callback("❌ No active layer.")
+            return
+        file_hash = active_layer.customProperty("DronePrecisionMapper:file_hash", None)
+        source_image = active_layer.customProperty("DronePrecisionMapper:source_image", None)
+        if not file_hash and not source_image:
+            self.coord_callback("❌ The selected layer is not a processed drone image.")
+            return
+        counter_key = file_hash or source_image
+        self.persistent_counters = load_persistent_counters()
+        click_count = self.persistent_counters.get(counter_key, 0) + 1
+        self.persistent_counters[counter_key] = click_count
+        save_persistent_counters(self.persistent_counters)
+        image_name = Path(source_image).stem if source_image else "Unknown"
         clicked_map_point = self.toMapCoordinates(event.pos())
-        print(f"Clicked at map coordinates: {clicked_map_point.x():.6f}, {clicked_map_point.y():.6f}")
-        
-        # Check if click is within the current layer extent with more tolerance
-        layer_extent = layer.extent()
-        # Increase tolerance significantly to account for coordinate precision issues and edge cases
-        tolerance = 0.00001  # About 10 meters in degrees (increased from 1 meter)
-        
-        # More flexible bounds checking - check if point is reasonably close to the layer
-        x_min, x_max = layer_extent.xMinimum() - tolerance, layer_extent.xMaximum() + tolerance
-        y_min, y_max = layer_extent.yMinimum() - tolerance, layer_extent.yMaximum() + tolerance
-        
-        if not (x_min <= clicked_map_point.x() <= x_max and y_min <= clicked_map_point.y() <= y_max):
-            # Additional check: if the point is very close to the bounds, allow it anyway
-            distance_to_bounds = min(
-                abs(clicked_map_point.x() - x_min), abs(clicked_map_point.x() - x_max),
-                abs(clicked_map_point.y() - y_min), abs(clicked_map_point.y() - y_max)
-            )
-            
-            # If within 5 meters of bounds, allow the click
-            if distance_to_bounds > 0.00005:  # About 5 meters in degrees
-                if self.coord_callback:
-                    self.coord_callback(f"⚠️ Click outside current image bounds - please click within the {Path(current_layer_data['image_path']).name} area")
-                return
-            else:
-                print(f"Click near bounds (distance: {distance_to_bounds:.6f}), allowing it")
-        
-        # Increment click counter
-        self.layer_click_counters[layer.id()] = self.layer_click_counters.get(layer.id(), 0) + 1
-        
-        # Show uncorrected marker immediately
-        self.uncorrected_markers[self.current_layer_index].setCenter(clicked_map_point)
-        self.uncorrected_markers[self.current_layer_index].setVisible(True)
-        
-        # Get coordinate transformation
-        provider = layer.dataProvider()
+        # Show uncorrected marker for this layer (find marker by active layer)
+        marker_idx = None
+        for i, layer_data in enumerate(self.processed_layers):
+            proc_layer = layer_data['params']['layer']
+            proc_hash = proc_layer.customProperty("DronePrecisionMapper:file_hash", None)
+            proc_source = proc_layer.customProperty("DronePrecisionMapper:source_image", None)
+            if (proc_hash and file_hash and proc_hash == file_hash) or (proc_source and source_image and proc_source == source_image):
+                marker_idx = i
+                break
+        if marker_idx is None:
+            self.coord_callback("❌ Could not match the active layer to a processed drone image.")
+            return
+        for m in self.markers: m.setVisible(False)
+        for m in self.uncorrected_markers: m.setVisible(False)
+        self.uncorrected_markers[marker_idx].setCenter(clicked_map_point)
+        self.uncorrected_markers[marker_idx].setVisible(True)
+        provider = active_layer.dataProvider()
         geotransform = provider.extent()
-        
         if not geotransform.isNull():
             width = provider.xSize()
             height = provider.ySize()
-            
-            # Use more reliable coordinate transformation
             try:
-                # Get the layer's coordinate reference system
-                layer_crs = layer.crs()
-                
-                # Calculate pixel size more accurately
                 pixel_width = geotransform.width() / width
                 pixel_height = geotransform.height() / height
                 x_origin = geotransform.xMinimum()
                 y_origin = geotransform.yMaximum()
-                
-                # Convert map coordinates to pixel coordinates
                 px = (clicked_map_point.x() - x_origin) / pixel_width
                 py = (y_origin - clicked_map_point.y()) / pixel_height
-                
-                # Validate pixel coordinates are within image bounds with tolerance
-                pixel_tolerance = 5  # Allow clicks up to 5 pixels outside the image
+                pixel_tolerance = 5
                 if px < -pixel_tolerance or px >= width + pixel_tolerance or py < -pixel_tolerance or py >= height + pixel_tolerance:
-                    if self.coord_callback:
-                        self.coord_callback("⚠️ Click outside image pixel bounds")
+                    self.coord_callback("⚠️ Click outside image pixel bounds")
                     return
-                
-                # Clamp pixel coordinates to image bounds
                 px = max(0, min(width - 1, px))
                 py = max(0, min(height - 1, py))
-                
-                print(f"Pixel coordinates: {px:.2f}, {py:.2f}")
-                print(f"Image dimensions: {width}x{height}")
-                print(f"Layer extent: {geotransform.toString()}")
-                
-                # Use more reliable coordinate transformation
-                try:
-                    # Apply distortion correction
-                    px_corr, py_corr = apply_distortion_correction(
-                        px, py,
-                        current_layer_data['params']['image_width'],
-                        current_layer_data['params']['image_height'],
-                        current_layer_data['params']['distortion_k1'])
-                    
-                    # Convert back to map coordinates
-                    corrected_map_point = QgsPointXY(
-                        x_origin + px_corr * pixel_width,
-                        y_origin - py_corr * pixel_height
-                    )
-                    
-                    # Validate corrected coordinates are within layer bounds with tolerance
-                    if not (x_min <= corrected_map_point.x() <= x_max and y_min <= corrected_map_point.y() <= y_max):
-                        if self.coord_callback:
-                            self.coord_callback("⚠️ Corrected coordinates outside layer bounds")
-                        return
-                    
-                except Exception as e:
-                    print(f"Error in coordinate transformation: {e}")
-                    if self.coord_callback:
-                        self.coord_callback(f"❌ Error in coordinate calculation: {e}")
-                    return
-
-                self.markers[self.current_layer_index].setCenter(corrected_map_point)
-                self.markers[self.current_layer_index].setVisible(True)
-                
+                px_corr, py_corr = apply_distortion_correction(
+                    px, py,
+                    self.processed_layers[marker_idx]['params']['image_width'],
+                    self.processed_layers[marker_idx]['params']['image_height'],
+                    self.processed_layers[marker_idx]['params']['distortion_k1'])
+                corrected_map_point = QgsPointXY(
+                    x_origin + px_corr * pixel_width,
+                    y_origin - py_corr * pixel_height
+                )
                 dist_m = clicked_map_point.distance(corrected_map_point) * 111320
-                
-                # Create coordinate message
-                layer_name = layer.name() if layer.name() else "Unknown Layer"
-                coord_message = f"📍 {layer_name} - Click {self.layer_click_counters[layer.id()]}:\n"
+                coord_message = f"📍 {image_name} - Click {click_count}:\n"
                 coord_message += f"   Uncorrected: Lat={clicked_map_point.y():.6f}, Lon={clicked_map_point.x():.6f}\n"
                 coord_message += f"   Corrected:   Lat={corrected_map_point.y():.6f}, Lon={corrected_map_point.x():.6f}\n"
                 coord_message += f"   Correction:  ~{dist_m:.3f} meters\n"
-                
-                print(f"\n--- Precision Click (Layer {self.current_layer_index + 1}, Click {self.layer_click_counters[layer.id()]}) ---")
-                print(f"Image: {Path(current_layer_data['image_path']).name}")
-                print(f"Clicked (Uncorrected): Lat={clicked_map_point.y():.6f}, Lon={clicked_map_point.x():.6f}")
-                print(f"Result  (Corrected):  Lat={corrected_map_point.y():.6f}, Lon={corrected_map_point.x():.6f}")
-                print(f"Correction Distance:  ~{dist_m:.3f} meters")
-                
-                # Send to UI if callback is available
-                if self.coord_callback:
-                    self.coord_callback(coord_message)
-                
-                # Force canvas refresh to show markers
+                self.coord_callback(coord_message)
+                self.markers[marker_idx].setCenter(corrected_map_point)
+                self.markers[marker_idx].setVisible(True)
                 self.canvas.refresh()
             except Exception as e:
                 print(f"Error in coordinate transformation: {e}")
-                if self.coord_callback:
-                    self.coord_callback(f"❌ Error in coordinate calculation: {e}")
+                self.coord_callback(f"❌ Error in coordinate calculation: {e}")
                 return
         else:
             print("Error: Could not get geotransform from layer")
-            
-    def deactivate(self):
-        """Clean up when tool is deactivated."""
-        for marker in self.markers:
-            if marker:
-                marker.setVisible(False)
-                marker.setCenter(QgsPointXY(0, 0))  # Reset position
-        for marker in self.uncorrected_markers:
-            if marker:
-                marker.setVisible(False)
-                marker.setCenter(QgsPointXY(0, 0))  # Reset position
-        super().deactivate()
-        
-    def keyPressEvent(self, event):
-        if not self.processed_layers:
-            return
-            
-        key = event.key()
-        
-        if key == ord('N') or key == ord('n'):  # Next layer
-            self.current_layer_index = (self.current_layer_index + 1) % len(self.processed_layers)
-            self._update_layer_visibility()
-            
-        elif key == ord('P') or key == ord('p'):  # Previous layer
-            self.current_layer_index = (self.current_layer_index - 1) % len(self.processed_layers)
-            self._update_layer_visibility()
-            
-        elif key == ord('L') or key == ord('l'):  # List layers
-            self._list_layers()
-    
-    def _update_layer_visibility(self):
-        # First, hide all markers
-        for marker, uncorrected_marker in zip(self.markers, self.uncorrected_markers):
-            marker.setVisible(False)
-            uncorrected_marker.setVisible(False)
-        
-        # Then show only the current layer's markers
-        if 0 <= self.current_layer_index < len(self.markers):
-            self.markers[self.current_layer_index].setVisible(True)
-            self.uncorrected_markers[self.current_layer_index].setVisible(True)
-        
-        # Reset click counter when switching layers
-        self.layer_click_counters = {}
-        
-        current_layer_data = self.processed_layers[self.current_layer_index]
-        print(f"\nSwitched to layer: {Path(current_layer_data['image_path']).name}")
-        print(f"Click counter reset to 0")
-    
-    def _list_layers(self):
-        print(f"\n--- Available Layers ---")
-        for i, layer_data in enumerate(self.processed_layers):
-            marker = "→" if i == self.current_layer_index else " "
-            print(f"{marker} {i+1}: {Path(layer_data['image_path']).name}") 
 
 
 class BasicCoordinatePickerTool(QgsMapToolEmitPoint):

@@ -29,6 +29,7 @@ from qgis.utils import iface
 
 # Import our image processor
 from .image_processor import georeference_image, process_multiple_drone_photos, PrecisionClickTool, MultiLayerPrecisionClickTool, BasicCoordinatePickerTool
+import hashlib
 
 
 class CoordinateDisplayDock(QDockWidget):
@@ -95,10 +96,36 @@ class DronePrecisionMapper:
         self.active_tool = None
         self.processed_layers = []
         self.coordinate_dock = None
+        self.persistent_click_counters = self._load_persistent_counters()  # Load from QGIS project
         
         # Plugin actions
         self.action = None
         self.menu = None
+        
+    def _load_persistent_counters(self):
+        """Load persistent click counters from QGIS project metadata."""
+        try:
+            project = QgsProject.instance()
+            counters_str = project.readEntry("DronePrecisionMapper", "click_counters", "{}")[0]
+            import json
+            return json.loads(counters_str)
+        except:
+            return {}
+    
+    def _save_persistent_counters(self):
+        """Save persistent click counters to QGIS project metadata."""
+        try:
+            project = QgsProject.instance()
+            import json
+            counters_str = json.dumps(self.persistent_click_counters)
+            project.writeEntry("DronePrecisionMapper", "click_counters", counters_str)
+        except Exception as e:
+            print(f"Warning: Could not save persistent counters: {e}")
+    
+    def update_click_counter(self, image_path, new_count):
+        """Update click counter and save to persistent storage."""
+        self.persistent_click_counters[image_path] = new_count
+        self._save_persistent_counters()
         
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
@@ -369,18 +396,11 @@ class DronePrecisionMapperDialog(QDialog):
         if not Path(image_path).exists():
             QMessageBox.warning(self, "Warning", "Selected image file does not exist.")
             return
-            
         self.log_message("Processing single image...")
-        
-        # Clean up any existing tools first
         self.cleanup_existing_tools()
-        
-        # Process synchronously to avoid threading issues
         from .image_processor import georeference_image, PrecisionClickTool, BasicCoordinatePickerTool
-        
         result_params = georeference_image(image_path, self.log_message)
         if result_params == 'basic_picker':
-            # Already georeferenced raster, no EXIF: use basic picker
             layer = QgsProject.instance().mapLayersByName(Path(image_path).stem)[-1]
             picker_tool = BasicCoordinatePickerTool(self.canvas, layer, self.update_coordinate_display)
             self.canvas.setExtent(layer.extent())
@@ -390,82 +410,70 @@ class DronePrecisionMapperDialog(QDialog):
             self.log_message("ℹ️ This image is already georeferenced but lacks drone EXIF. Advanced correction is disabled, but you can still pick coordinates.")
             return
         if result_params:
-            # Create a FRESH precision click tool with coordinate callback
-            # This ensures the tool has the correct layer reference
-            precision_tool = PrecisionClickTool(self.canvas, result_params, self.update_coordinate_display)
-            
-            # Update canvas
+            # --- Tag the layer with a persistent identifier ---
+            layer = result_params['layer']
+            layer.setCustomProperty("DronePrecisionMapper:source_image", str(image_path))
+            try:
+                with open(image_path, "rb") as f:
+                    file_hash = hashlib.md5(f.read()).hexdigest()
+                layer.setCustomProperty("DronePrecisionMapper:file_hash", file_hash)
+            except Exception as e:
+                self.log_message(f"⚠️ Could not compute file hash: {e}")
+            # --------------------------------------------------
+            precision_tool = PrecisionClickTool(self.canvas, result_params, self.update_coordinate_display, self.plugin.persistent_click_counters)
             self.canvas.setExtent(result_params['layer'].extent())
             self.canvas.refresh()
-            
-            # Set the tool and ensure it's active
             self.canvas.setMapTool(precision_tool)
-            
-            # Force canvas to update and ensure tool is active
             self.canvas.refresh()
-            
-            # Store reference to prevent garbage collection
             self.plugin.active_tool = precision_tool
-            
             self.log_message("✅ Single image processed successfully!")
             self.log_message("Precision click tool activated. Click on the image to get coordinates.")
             self.log_message("💡 Tip: Coordinates will appear in the 'Coordinate Display' dock widget.")
-            # Keep dialog open but allow closing
         else:
             self.log_message("❌ Single image processing failed.")
-        
+
     def process_batch_images(self):
         """Process multiple images in batch."""
         folder_path = self.batch_folder_edit.text().strip()
         if not Path(folder_path).exists():
             QMessageBox.warning(self, "Warning", "Selected folder does not exist.")
             return
-            
         self.log_message("Processing batch images...")
-        
-        # Clean up any existing tools first
         self.cleanup_existing_tools()
-        
-        # Show progress and cancel button
         self.progress_bar.setVisible(True)
         self.cancel_btn.setVisible(True)
         self.progress_bar.setValue(0)
-        
-        # Process synchronously to avoid threading issues
         from .image_processor import process_multiple_drone_photos, MultiLayerPrecisionClickTool
-        
         processed_layers = process_multiple_drone_photos(folder_path, self.log_message, self.progress_bar)
-        
-        # Hide progress and cancel button
+        # --- Tag each processed layer with a persistent identifier ---
+        for layer_data in processed_layers:
+            image_path = layer_data['params']['image_path']
+            layer = layer_data['params']['layer']
+            layer.setCustomProperty("DronePrecisionMapper:source_image", str(image_path))
+            try:
+                with open(image_path, "rb") as f:
+                    file_hash = hashlib.md5(f.read()).hexdigest()
+                layer.setCustomProperty("DronePrecisionMapper:file_hash", file_hash)
+            except Exception as e:
+                self.log_message(f"⚠️ Could not compute file hash: {e}")
+        # ------------------------------------------------------------
         self.progress_bar.setVisible(False)
         self.cancel_btn.setVisible(False)
-        
         if processed_layers:
-            # Create multi-layer precision tool with coordinate callback
-            multi_tool = MultiLayerPrecisionClickTool(self.canvas, processed_layers, self.update_coordinate_display)
-            
-            # Set extent to show all layers
+            multi_tool = MultiLayerPrecisionClickTool(self.canvas, processed_layers, self.update_coordinate_display, self.plugin.persistent_click_counters)
             all_extents = [layer_data['params']['layer'].extent() for layer_data in processed_layers]
             combined_extent = all_extents[0]
             for extent in all_extents[1:]:
                 combined_extent.combineExtentWith(extent)
             self.canvas.setExtent(combined_extent)
             self.canvas.refresh()
-            
-            # Set the tool and ensure it's active
             self.canvas.setMapTool(multi_tool)
-            
-            # Force canvas to update and ensure tool is active
             self.canvas.refresh()
-            
-            # Store reference to prevent garbage collection
             self.plugin.active_tool = multi_tool
-            
             self.log_message(f"✅ Successfully processed {len(processed_layers)} images!")
             self.log_message("Multi-layer precision tool activated.")
             self.log_message("Use keyboard shortcuts: N (next), P (previous), L (list)")
             self.log_message("💡 Tip: Coordinates will appear in the 'Coordinate Display' dock widget.")
-            # Don't close the dialog - keep it open to show coordinates
         else:
             self.log_message("❌ Batch processing failed.")
 

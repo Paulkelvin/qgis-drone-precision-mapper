@@ -42,6 +42,9 @@ gdal.AllRegister()
 active_precision_tool = None
 processed_layers_data = None
 
+# Store click counters globally to persist across script re-runs
+global_click_counters = {}
+
 # --- Helper Functions ---
 
 def convert_rational_to_float(value):
@@ -476,6 +479,23 @@ def create_precision_click_tool_for_layers(processed_layers):
             self.current_layer_index = 0
             self.canvas = canvas
             
+            # Initialize click counters from global storage or create new ones
+            global global_click_counters
+            self.click_counters = []
+            
+            for i, layer_data in enumerate(processed_layers):
+                # Get the layer identifier (filename without extension)
+                layer_id = Path(layer_data['image_path']).stem
+                
+                # Initialize counter from global storage or start at 0
+                if layer_id in global_click_counters:
+                    self.click_counters.append(global_click_counters[layer_id])
+                    print(f"[DEBUG] Restored click counter for {layer_id}: {global_click_counters[layer_id]}")
+                else:
+                    self.click_counters.append(0)
+                    global_click_counters[layer_id] = 0
+                    print(f"[DEBUG] Initialized click counter for {layer_id}: 0")
+            
             # Create markers for each layer
             self.markers = []
             self.uncorrected_markers = []
@@ -506,7 +526,9 @@ def create_precision_click_tool_for_layers(processed_layers):
             print(f"  'N' - Next layer")
             print(f"  'P' - Previous layer")
             print(f"  'L' - List all layers")
+            print(f"  'R' - Reset all counters")
             print(f"Click on the image to get distortion-corrected coordinates.")
+            print(f"[DEBUG] Global click counters: {global_click_counters}")
         
         def canvasReleaseEvent(self, event):
             if not self.processed_layers:
@@ -517,6 +539,22 @@ def create_precision_click_tool_for_layers(processed_layers):
             
             if not layer or not isinstance(layer, QgsRasterLayer):
                 return
+
+            # Get the layer identifier
+            layer_id = Path(current_layer_data['image_path']).stem
+            
+            # Increment click counter for current layer
+            self.click_counters[self.current_layer_index] += 1
+            current_click_count = self.click_counters[self.current_layer_index]
+            
+            # Update global storage
+            global global_click_counters
+            global_click_counters[layer_id] = current_click_count
+            
+            # Debug: Print current state of all counters
+            print(f"\n[DEBUG] All click counters: {self.click_counters}")
+            print(f"[DEBUG] Global click counters: {global_click_counters}")
+            print(f"[DEBUG] Current layer index: {self.current_layer_index}")
 
             clicked_map_point = self.toMapCoordinates(event.pos())
             
@@ -553,11 +591,13 @@ def create_precision_click_tool_for_layers(processed_layers):
                 self.markers[self.current_layer_index].setCenter(corrected_map_point)
                 dist_m = clicked_map_point.distance(corrected_map_point) * 111320
                 
-                print(f"\n--- Precision Click (Layer {self.current_layer_index + 1}) ---")
-                print(f"Image: {Path(current_layer_data['image_path']).name}")
-                print(f"Clicked (Uncorrected): Lat={clicked_map_point.y():.6f}, Lon={clicked_map_point.x():.6f}")
-                print(f"Result  (Corrected):  Lat={corrected_map_point.y():.6f}, Lon={corrected_map_point.x():.6f}")
-                print(f"Correction Distance:  ~{dist_m:.3f} meters")
+                # Get the image filename for display
+                image_filename = Path(current_layer_data['image_path']).stem
+                
+                print(f"\n📍 {image_filename} - Click {current_click_count}:")
+                print(f"   Uncorrected: Lat={clicked_map_point.y():.6f}, Lon={clicked_map_point.x():.6f}")
+                print(f"   Corrected:   Lat={corrected_map_point.y():.6f}, Lon={corrected_map_point.x():.6f}")
+                print(f"   Correction:  ~{dist_m:.3f} meters")
         
         def keyPressEvent(self, event):
             if not self.processed_layers:
@@ -575,6 +615,17 @@ def create_precision_click_tool_for_layers(processed_layers):
                 
             elif key == ord('L') or key == ord('l'):  # List layers
                 self._list_layers()
+                
+            elif key == ord('R') or key == ord('r'):  # Reset counters
+                self._reset_all_counters()
+        
+        def _reset_all_counters(self):
+            """Reset all click counters to 0"""
+            global global_click_counters
+            self.click_counters = [0] * len(self.processed_layers)
+            global_click_counters.clear()
+            print(f"\n[DEBUG] All click counters reset to: {self.click_counters}")
+            print("All click counters have been reset to 0.")
         
         def _update_layer_visibility(self):
             for i, (marker, uncorrected_marker) in enumerate(zip(self.markers, self.uncorrected_markers)):
@@ -583,13 +634,20 @@ def create_precision_click_tool_for_layers(processed_layers):
                 uncorrected_marker.setVisible(is_visible)
             
             current_layer_data = self.processed_layers[self.current_layer_index]
-            print(f"\nSwitched to layer: {Path(current_layer_data['image_path']).name}")
+            current_click_count = self.click_counters[self.current_layer_index]
+            print(f"\nSwitched to layer: {Path(current_layer_data['image_path']).name} (Click count: {current_click_count})")
+            print(f"[DEBUG] All click counters: {self.click_counters}")
+            print(f"[DEBUG] Global click counters: {global_click_counters}")
         
         def _list_layers(self):
             print(f"\n--- Available Layers ---")
             for i, layer_data in enumerate(self.processed_layers):
                 marker = "→" if i == self.current_layer_index else " "
-                print(f"{marker} {i+1}: {Path(layer_data['image_path']).name}")
+                click_count = self.click_counters[i]
+                layer_id = Path(layer_data['image_path']).stem
+                print(f"{marker} {i+1}: {layer_id} (Clicks: {click_count})")
+            print(f"[DEBUG] All click counters: {self.click_counters}")
+            print(f"[DEBUG] Global click counters: {global_click_counters}")
     
     return MultiLayerPrecisionClickTool(canvas, processed_layers)
 
