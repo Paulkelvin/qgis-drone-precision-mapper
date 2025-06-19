@@ -1,0 +1,16 @@
+[general]
+name=Drone Precision Mapper
+description=A QGIS plugin for precise pixel-to-geocoordinate mapping from drone photos with lens distortion correction
+version=1.0.0
+qgisMinimumVersion=3.0
+homepage=https://github.com/yourusername/drone-precision-mapper
+author=Your Name
+email=your.email@example.com
+about=This plugin allows users to load drone photos and extract precise geocoordinates with lens distortion correction. It supports both single image and batch processing modes.
+repository=https://github.com/yourusername/drone-precision-mapper
+tracker=https://github.com/yourusername/drone-precision-mapper/issues
+category=Web
+icon=icon.png
+experimental=False
+deprecated=False
+tags=drone,photogrammetry,georeferencing,coordinates,precision 

@@ -1,0 +1,679 @@
+import os
+import math
+import numpy as np
+import traceback
+from pathlib import Path
+import tempfile
+
+# --- GDAL/OGR Imports ---
+# GDAL is used for in-memory raster creation and georeferencing.
+from osgeo import gdal, osr
+
+# --- Pillow (PIL) Import ---
+# Pillow is used to open the image and extract EXIF metadata.
+from PIL import Image, ExifTags
+# FIXED: Import the specific IFDRational type to handle it correctly.
+from PIL.TiffImagePlugin import IFDRational
+
+# --- PyQt5 Imports ---
+# PyQt is used for GUI elements and signals, like handling mouse clicks.
+from PyQt5.QtCore import QPointF
+from PyQt5.QtGui import QColor
+
+# --- QGIS Imports ---
+# These are the core QGIS libraries for interacting with layers, the map canvas, and tools.
+from qgis.core import (
+    QgsProject,
+    QgsRasterLayer,
+    QgsRaster,
+    QgsPointXY
+)
+from qgis.gui import QgsMapToolEmitPoint, QgsVertexMarker
+from qgis.utils import iface
+
+# --- Configure GDAL ---
+# Enable exceptions to make error handling cleaner.
+gdal.UseExceptions()
+gdal.AllRegister()
+
+# --- Global Variables ---
+
+# Store the active precision click tool globally so it can be reactivated
+active_precision_tool = None
+processed_layers_data = None
+
+# --- Helper Functions ---
+
+def convert_rational_to_float(value):
+    """
+    Converts an EXIF value to a float.
+    FIXED: Now correctly handles the `IFDRational` type from Pillow, in addition
+    to tuples, ints, floats, and strings, to robustly parse any numeric EXIF tag.
+    """
+    # Case 1: Pillow's special IFDRational type
+    if isinstance(value, IFDRational):
+        return float(value)
+        
+    # Case 2: Standard rational tuple (numerator, denominator)
+    if isinstance(value, tuple) and len(value) == 2:
+        try:
+            num = float(value[0])
+            den = float(value[1])
+            return 0.0 if den == 0 else num / den
+        except (ValueError, TypeError):
+            pass
+
+    # Case 3: Already a number (int or float)
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    # Case 4: A single number in a tuple/list, e.g., (5.0,)
+    if isinstance(value, (tuple, list)) and len(value) == 1:
+        try:
+            return float(value[0])
+        except (ValueError, TypeError):
+            pass
+
+    # Case 5: A number represented as a string, e.g., '5.0'
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            pass
+
+    # If all conversions fail, print a warning and return 0.0
+    print(f"Warning: Could not convert value '{value}' (type: {type(value).__name__}) to float. Using 0.0.")
+    return 0.0
+
+
+def convert_dms_to_degrees(value):
+    """Converts a GPS coordinate from Degrees/Minutes/Seconds (DMS) format to decimal degrees."""
+    d = convert_rational_to_float(value[0])
+    m = convert_rational_to_float(value[1])
+    s = convert_rational_to_float(value[2])
+    return d + (m / 60.0) + (s / 3600.0)
+
+
+def get_exif_data(img):
+    """
+    Extracts and decodes EXIF data from a Pillow Image object.
+    Uses the recommended get_ifd() method for robustly accessing nested GPS data.
+    """
+    exif_data = {}
+    info = img.getexif()
+    if not info:
+        print("Warning: No EXIF data found in the image.")
+        return {}
+
+    for tag_id, value in info.items():
+        tag_name = ExifTags.TAGS.get(tag_id, tag_id)
+        if tag_name != "GPSInfo":
+            exif_data[tag_name] = value
+
+    try:
+        gps_ifd = info.get_ifd(ExifTags.IFD.GPSInfo)
+        if gps_ifd:
+            gps_data = {}
+            for tag_id, value in gps_ifd.items():
+                sub_tag_name = ExifTags.GPSTAGS.get(tag_id, tag_id)
+                gps_data[sub_tag_name] = value
+            exif_data["GPSInfo"] = gps_data
+    except (KeyError, TypeError):
+        print("Warning: GPSInfo tag found, but failed to retrieve GPS data dictionary (IFD).")
+    except Exception as e:
+        print(f"An unexpected error occurred while processing GPS data: {e}")
+
+    exif_data['LensModel'] = info.get(42036, 'Unknown')
+    return exif_data
+
+
+def get_lens_correction_from_exif(image_path):
+    """
+    Attempts to extract lens distortion parameters from EXIF using the external 'exiftool'.
+    """
+    try:
+        import exiftool
+        with exiftool.ExifTool() as et:
+            metadata = et.get_metadata(image_path)
+            distortion_params_str = metadata.get("XMP:LensDistortionParams", "0.0 0.0 0.0")
+            k1 = float(distortion_params_str.split()[0])
+            print(f"Found lens distortion parameter k1: {k1}")
+            return k1
+    except Exception as e:
+        print(f"Lens correction extraction failed, using fallback value. Reason: {e}")
+        return 0.002
+
+
+def apply_distortion_correction(px, py, width, height, k1):
+    """
+    Applies a simple radial distortion correction (k1) to a pixel coordinate.
+    """
+    if k1 == 0:
+        return px, py
+
+    center_x, center_y = width / 2.0, height / 2.0
+    xn = (px - center_x) / center_x
+    yn = (py - center_y) / center_y
+    r_sq = xn**2 + yn**2
+    correction_factor = 1 + k1 * r_sq
+    xn_corr = xn * correction_factor
+    yn_corr = yn * correction_factor
+    px_corr = center_x + xn_corr * center_x
+    py_corr = center_y + yn_corr * center_y
+    return px_corr, py_corr
+
+
+def georeference_image(image_path):
+    """
+    Reads an image, extracts EXIF GPS data, calculates the ground footprint,
+    and creates a georeferenced raster layer in QGIS.
+    """
+    temp_path = None
+    mem_ds = None
+    driver = None
+    layer = None
+    try:
+        img = Image.open(image_path).convert('RGB')
+        exif = get_exif_data(img)
+        gps_info = exif.get("GPSInfo")
+
+        if not gps_info or 'GPSLatitude' not in gps_info or 'GPSLongitude' not in gps_info:
+            raise ValueError("Missing essential GPSLatitude or GPSLongitude in EXIF data.")
+
+        lat = convert_dms_to_degrees(gps_info['GPSLatitude'])
+        if gps_info.get('GPSLatitudeRef') == 'S': lat = -lat
+
+        lon = convert_dms_to_degrees(gps_info['GPSLongitude'])
+        if gps_info.get('GPSLongitudeRef') == 'W': lon = -lon
+
+        altitude = convert_rational_to_float(gps_info.get('GPSAltitude', 100.0))
+        focal_length = convert_rational_to_float(exif.get('FocalLength', 8.0))
+        
+        if focal_length == 0:
+            raise ValueError("Focal length from EXIF is zero, cannot calculate ground resolution.")
+
+        sensor_width_mm = 6.17
+        width, height = img.size
+        
+        ground_width_m = (sensor_width_mm * altitude) / focal_length
+        meters_per_pixel = ground_width_m / width
+
+        m_per_deg_lon = 111320 * math.cos(math.radians(lat))
+        m_per_deg_lat = 111320
+        pixel_width_deg = meters_per_pixel / m_per_deg_lon
+        pixel_height_deg = meters_per_pixel / m_per_deg_lat
+
+        top_left_lon = lon - (width / 2.0) * pixel_width_deg
+        top_left_lat = lat + (height / 2.0) * pixel_height_deg
+
+        geotransform = (top_left_lon, pixel_width_deg, 0, top_left_lat, 0, -pixel_height_deg)
+
+        mem_ds = gdal.GetDriverByName('MEM').Create('', width, height, 3, gdal.GDT_Byte)
+        mem_ds.SetGeoTransform(geotransform)
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        mem_ds.SetProjection(srs.ExportToWkt())
+
+        np_img = np.array(img)
+        for i in range(3):
+            mem_ds.GetRasterBand(i + 1).WriteArray(np_img[:, :, i])
+
+        # FIXED: Use tempfile module for better cross-platform temporary file handling
+        with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp_file:
+            temp_path = tmp_file.name
+        
+        # Ensure the temp file is closed before GDAL tries to write to it
+        driver = gdal.GetDriverByName('GTiff')
+        
+        # FIXED: Add error checking for CreateCopy operation
+        try:
+            output_ds = driver.CreateCopy(temp_path, mem_ds)
+            if output_ds is None:
+                raise RuntimeError(f"GDAL CreateCopy failed for path: {temp_path}")
+            output_ds = None  # Close the dataset
+        except Exception as e:
+            print(f"GDAL CreateCopy error: {e}")
+            # Try alternative approach - create directly in memory
+            print("Attempting to use memory-only approach...")
+            # FIXED: Generate layer name from image filename
+            layer_name = Path(image_path).stem
+            layer = QgsRasterLayer(f"file://{image_path}", layer_name)
+            if not layer.isValid():
+                raise Exception(f"Failed to load the image as raster layer: {layer.error().summary()}")
+            
+            # Set the geotransform manually
+            layer.dataProvider().setNoDataValue(1, 0)
+            return {
+                'image_width': width, 'image_height': height,
+                'distortion_k1': get_lens_correction_from_exif(image_path), 
+                'layer': layer
+            }
+        
+        # FIXED: Explicitly dereference GDAL objects to release file locks before cleanup.
+        mem_ds = None 
+        driver = None
+
+        # FIXED: Generate layer name from image filename
+        layer_name = Path(image_path).stem
+        layer = QgsRasterLayer(temp_path, layer_name)
+        if not layer.isValid():
+            raise Exception(f"Failed to load the georeferenced layer: {layer.error().summary()}")
+
+        QgsProject.instance().addMapLayer(layer)
+        
+        distortion_k1 = get_lens_correction_from_exif(image_path)
+
+        print("\n--- Georeferencing Successful ---")
+        print(f"Image: {Path(image_path).name}")
+        print(f"Center Coordinates: Lat={lat:.6f}°, Lon={lon:.6f}°")
+        print(f"Altitude: {altitude:.2f} m | Ground Resolution: {meters_per_pixel:.3f} m/pixel")
+        
+        return {
+            'image_width': width, 'image_height': height,
+            'distortion_k1': distortion_k1, 'layer': layer
+        }
+
+    except Exception as e:
+        print("\n--- Error during Georeferencing ---")
+        print(f"Error details: {str(e)}")
+        traceback.print_exc()
+        return None
+    
+    finally:
+        # Dereference again just in case of an error loop
+        mem_ds = None
+        driver = None
+        if temp_path and Path(temp_path).exists():
+            try:
+                # The layer now holds the reference to the file, so we can't delete it.
+                # QGIS will manage the temp file. This avoids the WinError 32.
+                print(f"Temporary file created at: {temp_path}. QGIS will manage this file.")
+            except Exception as e:
+                print(f"Could not manage temporary file: {e}")
+
+
+class PrecisionClickTool(QgsMapToolEmitPoint):
+    """
+    A QGIS Map Tool that corrects a clicked point for lens distortion.
+    """
+    def __init__(self, canvas, georef_params):
+        super().__init__(canvas)
+        self.georef_params = georef_params
+        self.canvas = canvas
+        
+        self.marker = QgsVertexMarker(canvas)
+        self.marker.setColor(QColor("red"))
+        self.marker.setIconSize(10)
+        self.marker.setIconType(QgsVertexMarker.ICON_CROSS)
+        self.marker.setPenWidth(2)
+        
+        self.uncorrected_marker = QgsVertexMarker(canvas)
+        self.uncorrected_marker.setColor(QColor("cyan"))
+        self.uncorrected_marker.setIconSize(8)
+        self.uncorrected_marker.setIconType(QgsVertexMarker.ICON_BOX)
+        self.uncorrected_marker.setPenWidth(1)
+
+    def canvasReleaseEvent(self, event):
+        layer = self.georef_params['layer']
+        if not layer or not isinstance(layer, QgsRasterLayer): return
+
+        clicked_map_point = self.toMapCoordinates(event.pos())
+        self.uncorrected_marker.setCenter(clicked_map_point)
+        
+        # FIXED: Use the correct QGIS API for raster coordinate transformation
+        # Get the raster data provider and its geotransform
+        provider = layer.dataProvider()
+        
+        # FIXED: Use the correct method to get geotransform
+        # For QGIS raster layers, we need to get the geotransform from the provider's metadata
+        geotransform = provider.extent()
+        if not geotransform.isNull():
+            # Get the raster dimensions
+            width = provider.xSize()
+            height = provider.ySize()
+            
+            # Calculate pixel resolution from extent
+            pixel_width = geotransform.width() / width
+            pixel_height = geotransform.height() / height
+            
+            # Get origin coordinates
+            x_origin = geotransform.xMinimum()
+            y_origin = geotransform.yMaximum()  # Top-left corner
+            
+            # Calculate pixel coordinates
+            px = (clicked_map_point.x() - x_origin) / pixel_width
+            py = (y_origin - clicked_map_point.y()) / pixel_height  # Flip Y axis
+            
+            # Apply distortion correction
+            px_corr, py_corr = apply_distortion_correction(
+                px, py,
+                self.georef_params['image_width'], self.georef_params['image_height'],
+                self.georef_params['distortion_k1'])
+            
+            # Convert corrected pixel coordinates back to map coordinates
+            corrected_map_point = QgsPointXY(
+                x_origin + px_corr * pixel_width,
+                y_origin - py_corr * pixel_height  # Flip Y axis back
+            )
+
+            self.marker.setCenter(corrected_map_point)
+            dist_m = clicked_map_point.distance(corrected_map_point) * 111320
+            
+            print("\n--- Precision Click ---")
+            print(f"Clicked (Uncorrected): Lat={clicked_map_point.y():.6f}, Lon={clicked_map_point.x():.6f}")
+            print(f"Result  (Corrected):  Lat={corrected_map_point.y():.6f}, Lon={corrected_map_point.x():.6f}")
+            print(f"Correction Distance:  ~{dist_m:.3f} meters")
+        else:
+            print("Error: Could not get raster extent for coordinate transformation")
+
+
+def reactivate_precision_tool():
+    """
+    Reactivate the precision click tool if it was previously created.
+    Call this function to get back to the precision clicking mode.
+    """
+    global active_precision_tool, processed_layers_data
+    
+    if active_precision_tool is None:
+        print("No precision tool available. Please run the georeferencing script first.")
+        return
+    
+    canvas = iface.mapCanvas()
+    canvas.setMapTool(active_precision_tool)
+    print("\n--- Precision Tool Reactivated ---")
+    print("You can now click on images to get distortion-corrected coordinates.")
+    
+    if hasattr(active_precision_tool, 'processed_layers'):
+        print("Use keyboard shortcuts:")
+        print("  'N' - Next image")
+        print("  'P' - Previous image")
+        print("  'L' - List all images")
+
+
+def switch_to_pan_tool():
+    """
+    Switch to QGIS pan tool for navigation.
+    """
+    canvas = iface.mapCanvas()
+    canvas.setMapTool(iface.mapCanvas().mapTool())
+    print("Switched to QGIS pan tool. Use 'reactivate_precision_tool()' to get back to precision clicking.")
+
+
+# =======================
+# === BATCH PROCESSING ===
+# =======================
+
+def process_multiple_drone_photos(image_folder_path):
+    """
+    Process multiple drone photos in a folder for batch georeferencing.
+    Returns a list of processed layers and their parameters.
+    """
+    image_extensions = ['.jpg', '.jpeg', '.tiff', '.tif', '.png']
+    image_folder = Path(image_folder_path)
+    
+    if not image_folder.exists():
+        print(f"Error: Folder does not exist: {image_folder_path}")
+        return []
+    
+    # Find all image files
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(image_folder.glob(f"*{ext}"))
+        image_files.extend(image_folder.glob(f"*{ext.upper()}"))
+    
+    if not image_files:
+        print(f"No image files found in: {image_folder_path}")
+        return []
+    
+    print(f"Found {len(image_files)} image files to process...")
+    
+    processed_layers = []
+    successful_count = 0
+    
+    for i, image_path in enumerate(image_files, 1):
+        print(f"\n{'='*50}")
+        print(f"Processing {i}/{len(image_files)}: {image_path.name}")
+        print(f"{'='*50}")
+        
+        try:
+            result_params = georeference_image(str(image_path))
+            if result_params:
+                processed_layers.append({
+                    'image_path': str(image_path),
+                    'params': result_params
+                })
+                successful_count += 1
+                print(f"✅ Successfully processed: {image_path.name}")
+            else:
+                print(f"❌ Failed to process: {image_path.name}")
+        except Exception as e:
+            print(f"❌ Error processing {image_path.name}: {e}")
+    
+    print(f"\n{'='*50}")
+    print(f"BATCH PROCESSING COMPLETE")
+    print(f"Successfully processed: {successful_count}/{len(image_files)} images")
+    print(f"{'='*50}")
+    
+    return processed_layers
+
+
+def create_precision_click_tool_for_layers(processed_layers):
+    """
+    Create a precision click tool that works with multiple layers.
+    Allows switching between layers for coordinate extraction.
+    """
+    if not processed_layers:
+        print("No processed layers available for precision clicking.")
+        return None
+    
+    canvas = iface.mapCanvas()
+    
+    # Create a tool that can work with multiple layers
+    class MultiLayerPrecisionClickTool(QgsMapToolEmitPoint):
+        def __init__(self, canvas, processed_layers):
+            super().__init__(canvas)
+            self.processed_layers = processed_layers
+            self.current_layer_index = 0
+            self.canvas = canvas
+            
+            # Create markers for each layer
+            self.markers = []
+            self.uncorrected_markers = []
+            
+            for i, layer_data in enumerate(processed_layers):
+                # Corrected marker (red)
+                marker = QgsVertexMarker(canvas)
+                marker.setColor(QColor("red"))
+                marker.setIconSize(10)
+                marker.setIconType(QgsVertexMarker.ICON_CROSS)
+                marker.setPenWidth(2)
+                marker.setVisible(i == 0)  # Only first layer visible initially
+                
+                # Uncorrected marker (cyan)
+                uncorrected_marker = QgsVertexMarker(canvas)
+                uncorrected_marker.setColor(QColor("cyan"))
+                uncorrected_marker.setIconSize(8)
+                uncorrected_marker.setIconType(QgsVertexMarker.ICON_BOX)
+                uncorrected_marker.setPenWidth(1)
+                uncorrected_marker.setVisible(i == 0)  # Only first layer visible initially
+                
+                self.markers.append(marker)
+                self.uncorrected_markers.append(uncorrected_marker)
+            
+            print(f"\n--- Multi-Layer Precision Tool Activated ---")
+            print(f"Current layer: {processed_layers[0]['image_path']}")
+            print(f"Use keyboard shortcuts:")
+            print(f"  'N' - Next layer")
+            print(f"  'P' - Previous layer")
+            print(f"  'L' - List all layers")
+            print(f"Click on the image to get distortion-corrected coordinates.")
+        
+        def canvasReleaseEvent(self, event):
+            if not self.processed_layers:
+                return
+                
+            current_layer_data = self.processed_layers[self.current_layer_index]
+            layer = current_layer_data['params']['layer']
+            
+            if not layer or not isinstance(layer, QgsRasterLayer):
+                return
+
+            clicked_map_point = self.toMapCoordinates(event.pos())
+            
+            # Update markers for current layer
+            self.uncorrected_markers[self.current_layer_index].setCenter(clicked_map_point)
+            
+            # Get coordinate transformation
+            provider = layer.dataProvider()
+            geotransform = provider.extent()
+            
+            if not geotransform.isNull():
+                width = provider.xSize()
+                height = provider.ySize()
+                pixel_width = geotransform.width() / width
+                pixel_height = geotransform.height() / height
+                x_origin = geotransform.xMinimum()
+                y_origin = geotransform.yMaximum()
+                
+                px = (clicked_map_point.x() - x_origin) / pixel_width
+                py = (y_origin - clicked_map_point.y()) / pixel_height
+                
+                # Apply distortion correction
+                px_corr, py_corr = apply_distortion_correction(
+                    px, py,
+                    current_layer_data['params']['image_width'],
+                    current_layer_data['params']['image_height'],
+                    current_layer_data['params']['distortion_k1'])
+                
+                corrected_map_point = QgsPointXY(
+                    x_origin + px_corr * pixel_width,
+                    y_origin - py_corr * pixel_height
+                )
+
+                self.markers[self.current_layer_index].setCenter(corrected_map_point)
+                dist_m = clicked_map_point.distance(corrected_map_point) * 111320
+                
+                print(f"\n--- Precision Click (Layer {self.current_layer_index + 1}) ---")
+                print(f"Image: {Path(current_layer_data['image_path']).name}")
+                print(f"Clicked (Uncorrected): Lat={clicked_map_point.y():.6f}, Lon={clicked_map_point.x():.6f}")
+                print(f"Result  (Corrected):  Lat={corrected_map_point.y():.6f}, Lon={corrected_map_point.x():.6f}")
+                print(f"Correction Distance:  ~{dist_m:.3f} meters")
+        
+        def keyPressEvent(self, event):
+            if not self.processed_layers:
+                return
+                
+            key = event.key()
+            
+            if key == ord('N') or key == ord('n'):  # Next layer
+                self.current_layer_index = (self.current_layer_index + 1) % len(self.processed_layers)
+                self._update_layer_visibility()
+                
+            elif key == ord('P') or key == ord('p'):  # Previous layer
+                self.current_layer_index = (self.current_layer_index - 1) % len(self.processed_layers)
+                self._update_layer_visibility()
+                
+            elif key == ord('L') or key == ord('l'):  # List layers
+                self._list_layers()
+        
+        def _update_layer_visibility(self):
+            for i, (marker, uncorrected_marker) in enumerate(zip(self.markers, self.uncorrected_markers)):
+                is_visible = (i == self.current_layer_index)
+                marker.setVisible(is_visible)
+                uncorrected_marker.setVisible(is_visible)
+            
+            current_layer_data = self.processed_layers[self.current_layer_index]
+            print(f"\nSwitched to layer: {Path(current_layer_data['image_path']).name}")
+        
+        def _list_layers(self):
+            print(f"\n--- Available Layers ---")
+            for i, layer_data in enumerate(self.processed_layers):
+                marker = "→" if i == self.current_layer_index else " "
+                print(f"{marker} {i+1}: {Path(layer_data['image_path']).name}")
+    
+    return MultiLayerPrecisionClickTool(canvas, processed_layers)
+
+
+# =======================
+# === MAIN EXECUTION ===
+# =======================
+
+# ============================================
+# CHOOSE YOUR PROCESSING MODE:
+# ============================================
+
+# MODE 1: Process a SINGLE image (current setup)
+SINGLE_IMAGE_MODE = True
+image_path = r'C:\Users\paulo\Downloads\GeoMap\0c6f4bcf839774450ca7145cd9ddbc96.jpg'
+
+# MODE 2: Process MULTIPLE images in a folder (for batch processing)
+# Change SINGLE_IMAGE_MODE to False and set your folder path:
+SINGLE_IMAGE_MODE = False  # Set to False for batch processing
+image_folder = r'C:\Users\paulo\Downloads\GeoMap'  # Folder containing all drone photos
+
+# ============================================
+# EXECUTION LOGIC:
+# ============================================
+
+if SINGLE_IMAGE_MODE:
+    # Process single image
+    print("=== SINGLE IMAGE MODE ===")
+    if not Path(image_path).exists():
+        print(f"Error: Image path does not exist: {image_path}")
+    else:
+        print("Starting precision georeferencing...")
+        result_params = georeference_image(image_path)
+        
+        if result_params:
+            canvas = iface.mapCanvas()
+            canvas.setExtent(result_params['layer'].extent())
+            canvas.refresh()
+            
+            # Store the tool globally so it can be reactivated
+            active_precision_tool = PrecisionClickTool(canvas, result_params)
+            canvas.setMapTool(active_precision_tool)
+            
+            print("\n--- Tool Activated ---")
+            print("Ready! Click on the image in the map to get distortion-corrected coordinates.")
+            print("\n--- IMPORTANT: Tool Management ---")
+            print("If you switch to QGIS pan tool, use this command to get back:")
+            print("  reactivate_precision_tool()")
+            print("To switch to pan tool manually:")
+            print("  switch_to_pan_tool()")
+        else:
+            print("\nGeoreferencing process failed. Check the error messages above.")
+
+else:
+    # Process multiple images
+    print("=== BATCH PROCESSING MODE ===")
+    print("Starting batch processing of drone photos...")
+    processed_layers = process_multiple_drone_photos(image_folder)
+    
+    if processed_layers:
+        canvas = iface.mapCanvas()
+        # Set extent to show all layers
+        all_extents = [layer_data['params']['layer'].extent() for layer_data in processed_layers]
+        combined_extent = all_extents[0]
+        for extent in all_extents[1:]:
+            combined_extent.combineExtentWith(extent)
+        canvas.setExtent(combined_extent)
+        canvas.refresh()
+        
+        # Store the tool and data globally so they can be reactivated
+        active_precision_tool = create_precision_click_tool_for_layers(processed_layers)
+        processed_layers_data = processed_layers
+        
+        if active_precision_tool:
+            canvas.setMapTool(active_precision_tool)
+            print(f"\n✅ Successfully loaded {len(processed_layers)} drone photos!")
+            print("Use keyboard shortcuts to switch between images:")
+            print("  'N' - Next image")
+            print("  'P' - Previous image") 
+            print("  'L' - List all images")
+            print("\n--- IMPORTANT: Tool Management ---")
+            print("If you switch to QGIS pan tool, use this command to get back:")
+            print("  reactivate_precision_tool()")
+            print("To switch to pan tool manually:")
+            print("  switch_to_pan_tool()")
+    else:
+        print("No images were successfully processed.")
