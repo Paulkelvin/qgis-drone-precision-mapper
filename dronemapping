@@ -1,3 +1,9 @@
+# =============================================================
+# This file is a standalone script for georeferencing and analyzing
+# drone images in QGIS. It is NOT the QGIS plugin itself.
+# To use the QGIS plugin, see the DronePrecisionMapper directory.
+# =============================================================
+
 import os
 import math
 import numpy as np
@@ -447,10 +453,20 @@ def process_multiple_drone_photos(image_folder_path):
                 })
                 successful_count += 1
                 print(f"✅ Successfully processed: {image_path.name}")
+                # Print summary info for the image if available
+                lat = result_params.get('lat', None)
+                lon = result_params.get('lon', None)
+                altitude = result_params.get('altitude', None)
+                meters_per_pixel = result_params.get('meters_per_pixel', None)
+                if lat is not None and lon is not None:
+                    print(f"Center Coordinates: Lat={lat:.6f}°, Lon={lon:.6f}°")
+                if altitude is not None and meters_per_pixel is not None:
+                    print(f"Altitude: {altitude:.2f} m | Ground Resolution: {meters_per_pixel:.3f} m/pixel")
             else:
                 print(f"❌ Failed to process: {image_path.name}")
         except Exception as e:
             print(f"❌ Error processing {image_path.name}: {e}")
+        print("-" * 50)
     
     print(f"\n{'='*50}")
     print(f"BATCH PROCESSING COMPLETE")
