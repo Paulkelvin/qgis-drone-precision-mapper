@@ -232,7 +232,8 @@ class DronePrecisionMapperDialog(QDialog):
         self.plugin = plugin
         self.canvas = iface.mapCanvas()
         self.processor = None
-        
+        # Ensure standard OS window controls (minimize, maximize, close)
+        self.setWindowFlags(Qt.Window)
         print("Initializing DronePrecisionMapperDialog...")
         self.setup_ui()
         print("DronePrecisionMapperDialog setup complete")
@@ -314,21 +315,14 @@ class DronePrecisionMapperDialog(QDialog):
         self.progress_bar.setVisible(False)
         status_layout.addWidget(self.progress_bar)
         
-        # Add Minimize and Maximize buttons
-        self.minimize_btn = QPushButton("Minimize")
-        self.minimize_btn.clicked.connect(self.showMinimized)
-        self.maximize_btn = QPushButton("Maximize")
-        self.maximize_btn.clicked.connect(self._toggle_maximize)
+        # Remove Minimize and Maximize buttons, keep only Cancel for batch jobs
         self.cancel_btn = QPushButton("Cancel Batch Processing")
         self.cancel_btn.clicked.connect(self.cancel_batch_processing)
         self.cancel_btn.setVisible(False)
-
-        # Top-right button layout
+        # Top-right button layout (only Cancel remains)
         top_btn_layout = QHBoxLayout()
         top_btn_layout.addStretch()
         top_btn_layout.addWidget(self.cancel_btn)
-        top_btn_layout.addWidget(self.minimize_btn)
-        top_btn_layout.addWidget(self.maximize_btn)
         layout.addLayout(top_btn_layout)
         
         self.status_text = QTextEdit()
@@ -576,9 +570,3 @@ class DronePrecisionMapperDialog(QDialog):
     def clear_dialog_display(self):
         """Clear the dialog coordinate display."""
         self.coord_display.clear() 
-
-    def _toggle_maximize(self):
-        if self.isMaximized():
-            self.showNormal()
-        else:
-            self.showMaximized() 
