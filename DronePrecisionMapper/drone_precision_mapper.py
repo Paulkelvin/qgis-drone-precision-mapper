@@ -295,7 +295,6 @@ class DronePrecisionMapperDialog(QDialog):
         coord_layout = QVBoxLayout()
         
         self.coord_display = QTextEdit()
-        self.coord_display.setMaximumHeight(100)
         self.coord_display.setReadOnly(True)
         self.coord_display.setPlaceholderText("Click on the image to see coordinates here...")
         coord_layout.addWidget(self.coord_display)
@@ -326,7 +325,6 @@ class DronePrecisionMapperDialog(QDialog):
         layout.addLayout(top_btn_layout)
         
         self.status_text = QTextEdit()
-        self.status_text.setMaximumHeight(150)
         self.status_text.setReadOnly(True)
         status_layout.addWidget(self.status_text)
         
