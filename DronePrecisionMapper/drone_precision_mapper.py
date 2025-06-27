@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QRadioButton, QLineEdit, QTextEdit,
     QWidget, QDialog, QApplication, QDockWidget
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon, QColor
 
 # QGIS imports
@@ -83,6 +83,36 @@ class CoordinateDisplayDock(QDockWidget):
     def clear_display(self):
         """Clear the coordinate display."""
         self.coord_display.clear()
+
+
+class BatchProcessingWorker(QThread):
+    status_update = pyqtSignal(str)
+    progress_update = pyqtSignal(int)
+    finished = pyqtSignal(list)
+
+    def __init__(self, folder_path):
+        super().__init__()
+        self.folder_path = folder_path
+        self._is_cancelled = False
+
+    def run(self):
+        from .image_processor import process_multiple_drone_photos
+        def log_func(msg):
+            self.status_update.emit(msg)
+        class ProgressBarStub:
+            def __init__(self, worker):
+                self._value = 0
+                self.worker = worker
+            def setValue(self, v):
+                self._value = v
+                self.worker.progress_update.emit(v)
+            def setVisible(self, v):
+                pass
+            def value(self):
+                return self._value
+        progress_bar = ProgressBarStub(self)
+        processed_layers = process_multiple_drone_photos(self.folder_path, log_func, progress_bar)
+        self.finished.emit(processed_layers)
 
 
 class DronePrecisionMapper:
@@ -433,7 +463,7 @@ class DronePrecisionMapperDialog(QDialog):
             self.log_message("❌ Single image processing failed.")
 
     def process_batch_images(self):
-        """Process multiple images in batch."""
+        """Process multiple images in batch using a background thread."""
         folder_path = self.batch_folder_edit.text().strip()
         if not Path(folder_path).exists():
             QMessageBox.warning(self, "Warning", "Selected folder does not exist.")
@@ -443,8 +473,16 @@ class DronePrecisionMapperDialog(QDialog):
         self.progress_bar.setVisible(True)
         self.cancel_btn.setVisible(True)
         self.progress_bar.setValue(0)
-        from .image_processor import process_multiple_drone_photos, MultiLayerPrecisionClickTool
-        processed_layers = process_multiple_drone_photos(folder_path, self.log_message, self.progress_bar)
+        # Disable process button during processing
+        self.process_btn.setEnabled(False)
+        # Start worker thread
+        self.worker = BatchProcessingWorker(folder_path)
+        self.worker.status_update.connect(self.log_message)
+        self.worker.progress_update.connect(self.progress_bar.setValue)
+        self.worker.finished.connect(self._on_batch_processing_finished)
+        self.worker.start()
+
+    def _on_batch_processing_finished(self, processed_layers):
         # --- Tag each processed layer with a persistent identifier ---
         for layer_data in processed_layers:
             image_path = layer_data['params']['image_path']
@@ -459,7 +497,9 @@ class DronePrecisionMapperDialog(QDialog):
         # ------------------------------------------------------------
         self.progress_bar.setVisible(False)
         self.cancel_btn.setVisible(False)
+        self.process_btn.setEnabled(True)
         if processed_layers:
+            from .image_processor import MultiLayerPrecisionClickTool
             multi_tool = MultiLayerPrecisionClickTool(self.canvas, processed_layers, self.update_coordinate_display, self.plugin.persistent_click_counters)
             all_extents = [layer_data['params']['layer'].extent() for layer_data in processed_layers]
             combined_extent = all_extents[0]

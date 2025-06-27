@@ -376,8 +376,10 @@ def process_multiple_drone_photos(folder_path, log_func=None, progress_bar=None)
     
     for i, image_path in enumerate(image_files):
         if log_func:
-            log_func(f"Processing {i+1}/{len(image_files)}: {image_path.name}")
-        
+            if i > 0:
+                log_func("="*50 + "\n")
+            log_func(f"[{i+1}/{len(image_files)}] Processing: {image_path.name}")
+            log_func("-"*50)
         if progress_bar:
             progress_bar.setValue(int((i / len(image_files)) * 100))
             progress_bar.setVisible(True)
@@ -386,11 +388,34 @@ def process_multiple_drone_photos(folder_path, log_func=None, progress_bar=None)
                 if log_func:
                     log_func("⏹️ Batch processing cancelled by user")
                 break
-        
         try:
+            # Extract EXIF and image details for reporting
+            img = Image.open(image_path)
+            exif = get_exif_data(img)
+            width, height = img.size
+            camera_model = exif.get('Model', 'Unknown')
+            lens_model = exif.get('LensModel', 'Unknown')
+            date_time = exif.get('DateTime', 'Unknown')
+            gps_info = exif.get('GPSInfo', {})
+            gps_status = 'Yes' if ('GPSLatitude' in gps_info and 'GPSLongitude' in gps_info) else 'No'
+            focal_length = exif.get('FocalLength', None)
+            sensor_width = 6.17  # Default
+            if 'FocalLength' not in exif:
+                focal_length_str = '8.0 (default, not found in EXIF)'
+            else:
+                focal_length_str = f"{convert_rational_to_float(focal_length)}"
+            if 'Model' in exif and 'DJI' in str(exif['Model']):
+                sensor_width = 6.17  # DJI default
+            # Log extracted details
+            if log_func:
+                log_func(f"Image size: {width} x {height} px")
+                log_func(f"Camera: {camera_model}")
+                log_func(f"Lens: {lens_model}")
+                log_func(f"Captured: {date_time}")
+                log_func(f"GPS data found in EXIF: {gps_status}")
+                log_func(f"Focal Length: {focal_length_str} mm | Sensor Width: {sensor_width} mm")
             result_params = georeference_image(str(image_path), log_func)
             if result_params == 'basic_picker':
-                # Already georeferenced raster, create proper layer data structure
                 layer_name = Path(image_path).stem
                 layer = QgsProject.instance().mapLayersByName(layer_name)[-1]
                 processed_layers.append({
@@ -399,14 +424,15 @@ def process_multiple_drone_photos(folder_path, log_func=None, progress_bar=None)
                         'layer': layer,
                         'image_width': layer.width(),
                         'image_height': layer.height(),
-                        'distortion_k1': 0.0,  # No distortion correction for already georeferenced
-                        'layer_path': str(image_path),  # Add layer path for dynamic layer detection
-                        'layer_id': layer.id(),  # Add layer ID for more reliable detection
-                        'original_extent': layer.extent()  # Add original extent for matching
+                        'distortion_k1': 0.0,
+                        'layer_path': str(image_path),
+                        'layer_id': layer.id(),
+                        'original_extent': layer.extent()
                     }
                 })
                 successful_count += 1
                 if log_func:
+                    log_func(f"QGIS Layer: {layer.name()}")
                     log_func(f"✅ {image_path.name}")
             elif result_params:
                 processed_layers.append({
@@ -414,6 +440,23 @@ def process_multiple_drone_photos(folder_path, log_func=None, progress_bar=None)
                     'params': result_params
                 })
                 successful_count += 1
+                # Lens distortion
+                k1 = result_params.get('distortion_k1', None)
+                if log_func and k1 is not None:
+                    log_func(f"Lens Distortion (k1): {k1}")
+                # QGIS layer name
+                layer = result_params.get('layer', None)
+                if log_func and layer is not None:
+                    log_func(f"QGIS Layer: {layer.name()}")
+                # Print summary info for the image if available
+                lat = result_params.get('lat', None)
+                lon = result_params.get('lon', None)
+                altitude = result_params.get('altitude', None)
+                meters_per_pixel = result_params.get('meters_per_pixel', None)
+                if log_func and lat is not None and lon is not None:
+                    log_func(f"Center Coordinates: Lat={lat:.6f}°, Lon={lon:.6f}°")
+                if log_func and altitude is not None and meters_per_pixel is not None:
+                    log_func(f"Altitude: {altitude:.2f} m | Ground Resolution: {meters_per_pixel:.3f} m/pixel")
                 if log_func:
                     log_func(f"✅ {image_path.name}")
             else:
