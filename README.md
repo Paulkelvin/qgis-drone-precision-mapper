@@ -14,6 +14,8 @@ A QGIS plugin for fast, accurate georeferencing and coordinate extraction from d
 - Python packages: Pillow, numpy, PyQt5 (usually included with QGIS), GDAL
 - (Optional) ExifTool for advanced lens correction
 
+> **Note:** QGIS includes its own Python environment. You do **not** need to install Python separately for this plugin. All required Python packages should be available in a standard QGIS 3.x installation. If you encounter missing packages, use the OSGeo4W Shell (on Windows) or your system's package manager to install them within the QGIS environment.
+
 ## Installation
 1. **Clone or download this repository.**
 2. **Open a terminal and navigate to the directory containing `install_plugin.py`.**
@@ -42,13 +44,14 @@ A QGIS plugin for fast, accurate georeferencing and coordinate extraction from d
 4. **Click on loaded images to extract distortion-corrected coordinates.**
 5. **Coordinate results appear in the plugin's dock widget and QGIS Python Console.**
 
-## Standalone Script
-- The `dronemapping` file is a standalone script for georeferencing and analyzing drone images in QGIS. It is **not** the plugin itself. For most users, the plugin is recommended.
+After enabling, look for the Drone Precision Mapper icon in the QGIS toolbar:
 
-## License
-MIT License
+![Drone Precision Mapper Icon](DronePrecisionMapper/icon.png)
 
 ---
-For questions, issues, or contributions, please visit the [GitHub repository](https://github.com/Paulkelvin/qgis-drone-precision-mapper).
 
-**Need help?** If you have any problems installing or using this plugin, please email: [ibukunadesanya0@gmail.com](mailto:ibukunadesanya0@gmail.com) 
+![Screenshot: Drone Precision Mapper in QGIS](qgis_plugin_screenshot.png)
+*Screenshot: Drone Precision Mapper in QGIS after processing single and batch images. The plugin window and coordinate picking results are shown.*
+
+## Standalone Script
+- The `dronemapping`

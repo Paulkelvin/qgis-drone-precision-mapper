@@ -440,11 +440,35 @@ def process_multiple_drone_photos(image_folder_path):
     successful_count = 0
     
     for i, image_path in enumerate(image_files, 1):
-        print(f"\n{'='*50}")
-        print(f"Processing {i}/{len(image_files)}: {image_path.name}")
-        print(f"{'='*50}")
-        
+        print("\n" + "="*50)
+        print(f"[{i}/{len(image_files)}] Processing: {image_path.name}")
+        print("-"*50)
         try:
+            # Open image and extract EXIF before georeferencing
+            img = Image.open(image_path)
+            exif = get_exif_data(img)
+            width, height = img.size
+            camera_model = exif.get('Model', 'Unknown')
+            lens_model = exif.get('LensModel', 'Unknown')
+            date_time = exif.get('DateTime', 'Unknown')
+            gps_info = exif.get('GPSInfo', {})
+            gps_status = 'Yes' if ('GPSLatitude' in gps_info and 'GPSLongitude' in gps_info) else 'No'
+            focal_length = exif.get('FocalLength', None)
+            sensor_width = 6.17  # Default
+            if 'FocalLength' not in exif:
+                focal_length_str = '8.0 (default, not found in EXIF)'
+            else:
+                focal_length_str = f"{convert_rational_to_float(focal_length)}"
+            if 'Model' in exif and 'DJI' in str(exif['Model']):
+                sensor_width = 6.17  # DJI default
+            # Print extracted details
+            print(f"Image size: {width} x {height} px")
+            print(f"Camera: {camera_model}")
+            print(f"Lens: {lens_model}")
+            print(f"Captured: {date_time}")
+            print(f"GPS data found in EXIF: {gps_status}")
+            print(f"Focal Length: {focal_length_str} mm | Sensor Width: {sensor_width} mm")
+            # Georeference and get more details
             result_params = georeference_image(str(image_path))
             if result_params:
                 processed_layers.append({
@@ -452,7 +476,14 @@ def process_multiple_drone_photos(image_folder_path):
                     'params': result_params
                 })
                 successful_count += 1
-                print(f"✅ Successfully processed: {image_path.name}")
+                # Lens distortion
+                k1 = result_params.get('distortion_k1', None)
+                if k1 is not None:
+                    print(f"Lens Distortion (k1): {k1}")
+                # QGIS layer name
+                layer = result_params.get('layer', None)
+                if layer is not None:
+                    print(f"QGIS Layer: {layer.name()}")
                 # Print summary info for the image if available
                 lat = result_params.get('lat', None)
                 lon = result_params.get('lon', None)
@@ -462,11 +493,12 @@ def process_multiple_drone_photos(image_folder_path):
                     print(f"Center Coordinates: Lat={lat:.6f}°, Lon={lon:.6f}°")
                 if altitude is not None and meters_per_pixel is not None:
                     print(f"Altitude: {altitude:.2f} m | Ground Resolution: {meters_per_pixel:.3f} m/pixel")
+                print(f"✅ Successfully processed: {image_path.name}")
             else:
                 print(f"❌ Failed to process: {image_path.name}")
         except Exception as e:
             print(f"❌ Error processing {image_path.name}: {e}")
-        print("-" * 50)
+        print("="*50 + "\n")
     
     print(f"\n{'='*50}")
     print(f"BATCH PROCESSING COMPLETE")
