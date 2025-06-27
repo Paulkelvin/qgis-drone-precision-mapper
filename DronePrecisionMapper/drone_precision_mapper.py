@@ -14,7 +14,8 @@ from PyQt5.QtWidgets import (
     QAction, QFileDialog, QMessageBox, QProgressBar, 
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
     QGroupBox, QRadioButton, QLineEdit, QTextEdit,
-    QWidget, QDialog, QApplication, QDockWidget
+    QWidget, QDialog, QApplication, QDockWidget,
+    QSplitter
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon, QColor
@@ -304,9 +305,6 @@ class DronePrecisionMapperDialog(QDialog):
         coord_layout.addWidget(clear_btn)
         
         coord_group.setLayout(coord_layout)
-        layout.addWidget(coord_group)
-        
-        print("Added coordinate display group")
         
         # Status
         status_group = QGroupBox("Status")
@@ -328,9 +326,16 @@ class DronePrecisionMapperDialog(QDialog):
         status_layout.addWidget(self.status_text)
         
         status_group.setLayout(status_layout)
-        layout.addWidget(status_group)
         
-        print("Added status group")
+        # --- Use QSplitter for adjustable coordinate display and status ---
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(coord_group)
+        splitter.addWidget(status_group)
+        splitter.setSizes([150, 200])
+        layout.addWidget(splitter)
+        # ---------------------------------------------------------------
+        
+        print("Added coordinate display and status group with splitter")
         
         # Buttons
         button_layout = QHBoxLayout()
