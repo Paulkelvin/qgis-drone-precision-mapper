@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
     QWidget, QDialog, QApplication, QDockWidget,
     QSplitter
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
 from PyQt5.QtGui import QIcon, QColor
 
 # QGIS imports
@@ -312,7 +312,11 @@ class DronePrecisionMapperDialog(QDialog):
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        status_layout.addWidget(self.progress_bar)
+        self.progress_percent = QLabel("0%")
+        percent_layout = QHBoxLayout()
+        percent_layout.addWidget(self.progress_bar)
+        percent_layout.addWidget(self.progress_percent)
+        status_layout.addLayout(percent_layout)
         
         # Remove Minimize and Maximize buttons, keep only Cancel for batch jobs
         self.cancel_btn = QPushButton("Cancel Batch Processing")
@@ -366,6 +370,12 @@ class DronePrecisionMapperDialog(QDialog):
         self.on_mode_changed()
         
         print("UI setup complete")
+        
+        # For smooth progress bar animation
+        self._progress_target = 0
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(10)  # ms
+        self._progress_timer.timeout.connect(self._animate_progress)
         
     def on_mode_changed(self):
         """Handle mode selection changes."""
@@ -479,16 +489,37 @@ class DronePrecisionMapperDialog(QDialog):
         self.log_message("Processing batch images...")
         self.cleanup_existing_tools()
         self.progress_bar.setVisible(True)
-        self.cancel_btn.setVisible(True)
+        self.progress_percent.setVisible(True)
         self.progress_bar.setValue(0)
+        self.progress_percent.setText("0%")
+        self.cancel_btn.setVisible(True)
         # Disable process button during processing
         self.process_btn.setEnabled(False)
         # Start worker thread
         self.worker = BatchProcessingWorker(folder_path)
         self.worker.status_update.connect(self.log_message)
-        self.worker.progress_update.connect(self.progress_bar.setValue)
+        self.worker.progress_update.connect(self.smooth_set_progress)
         self.worker.finished.connect(self._on_batch_processing_finished)
         self.worker.start()
+
+    def smooth_set_progress(self, value):
+        # Animate from current value to target value
+        self._progress_target = value
+        if not self._progress_timer.isActive():
+            self._progress_timer.start()
+
+    def _animate_progress(self):
+        current = self.progress_bar.value()
+        target = self._progress_target
+        if current == target:
+            self._progress_timer.stop()
+            return
+        step = 1 if target > current else -1
+        new_value = current + step
+        self.progress_bar.setValue(new_value)
+        self.progress_percent.setText(f"{new_value}%")
+        if new_value == target:
+            self._progress_timer.stop()
 
     def _on_batch_processing_finished(self, processed_layers):
         # --- Tag each processed layer with a persistent identifier ---
@@ -504,6 +535,7 @@ class DronePrecisionMapperDialog(QDialog):
                 self.log_message(f"⚠️ Could not compute file hash: {e}")
         # ------------------------------------------------------------
         self.progress_bar.setVisible(False)
+        self.progress_percent.setVisible(False)
         self.cancel_btn.setVisible(False)
         self.process_btn.setEnabled(True)
         if processed_layers:
